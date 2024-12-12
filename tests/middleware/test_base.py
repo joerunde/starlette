@@ -1153,3 +1153,52 @@ async def test_poll_for_disconnect_repeated(send_body: bool) -> None:
         {"type": "http.response.body", "body": b"good!", "more_body": True},
         {"type": "http.response.body", "body": b"", "more_body": False},
     ]
+
+@pytest.mark.anyio
+async def test_client_disconnect_with_middleware() -> None:
+    # test for https://github.com/encode/starlette/discussions/2094
+    # Ensure that `request.is_disconnected` works when middleware is used
+
+    disconnect_received = anyio.Event()
+    response_complete = anyio.Event()
+
+    async def check_for_disconnect(request: Request) -> PlainTextResponse:
+        if await request.is_disconnected():
+            disconnect_received.set()
+            return PlainTextResponse("cancelled")
+
+        return PlainTextResponse("not cancelled")
+
+    async def passthrough(
+        request: Request,
+        call_next: RequestResponseEndpoint,
+    ) -> Response:
+        return await call_next(request)
+
+    app = Starlette(
+        middleware=[Middleware(BaseHTTPMiddleware, dispatch=passthrough)],
+        routes=[Route("/", check_for_disconnect)],
+    )
+
+    scope = {
+        "type": "http",
+        "version": "3",
+        "method": "GET",
+        "path": "/",
+    }
+
+    async def receive() -> Message:
+        # Simulate client disconnect
+        # request.is_disconnected() should always return True
+        return {"type": "http.disconnect"}
+
+    async def send(message: Message) -> None:
+        if message["type"] == "http.response.body":
+            if not message.get("more_body", False):
+                response_complete.set()
+
+    await app(scope, receive, send)
+
+    await response_complete.wait()
+
+    assert disconnect_received.is_set()
